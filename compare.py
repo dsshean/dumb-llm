@@ -21,12 +21,18 @@ def compare_models():
 
     print("\n🚀 Initializing RAG systems...")
     
-    # Initialize both RAG systems with same code, different models
-    print("\n📊 Loading IDK Model (Fine-tuned)...")
-    rag_idk = GemmaRAG(model_path="idk-gemma3-270m-lora")
+    # Initialize 4 RAG systems for all combinations
+    print("\n📊 Loading IDK Model (Evidence Gating ON)...")
+    rag_idk_gated = GemmaRAG(model_path="idk-gemma3-270m-lora", allow_no_evidence=False)
     
-    print("\n📊 Loading Base Model...")
-    rag_base = GemmaRAG(model_path="google/gemma-3-270m-it")
+    print("\n📊 Loading IDK Model (Evidence Gating OFF)...")
+    rag_idk_open = GemmaRAG(model_path="idk-gemma3-270m-lora", allow_no_evidence=True)
+    
+    print("\n📊 Loading Base Model (Evidence Gating ON)...")
+    rag_base_gated = GemmaRAG(model_path="google/gemma-3-270m-it", allow_no_evidence=False)
+    
+    print("\n📊 Loading Base Model (Evidence Gating OFF)...")
+    rag_base_open = GemmaRAG(model_path="google/gemma-3-270m-it", allow_no_evidence=True)
 
     # Load PDF documents for both
     print("\n📚 Loading PDF documents...")
@@ -37,17 +43,21 @@ def compare_models():
     print(f"Loaded {len(texts)} PDF documents")
 
     print("\n🔨 Building search indices...")
-    num_chunks_idk = rag_idk.build_index_from_texts(texts)
-    num_chunks_base = rag_base.build_index_from_texts(texts)
-    print(f"Indices built with {num_chunks_idk} chunks each")
+    num_chunks = rag_idk_gated.build_index_from_texts(texts)
+    rag_idk_open.build_index_from_texts(texts)
+    rag_base_gated.build_index_from_texts(texts)
+    rag_base_open.build_index_from_texts(texts)
+    print(f"Indices built with {num_chunks} chunks each")
 
-    print("\n✅ Both RAG systems ready!")
+    print("\n✅ All RAG systems ready!")
     print("="*80)
-    print("🔬 A/B COMPARISON MODE")
+    print("🔬 4-WAY COMPARISON MODE")
     print("="*80)
     print("Compare responses from:")
-    print("  🛡️  IDK Model (Fine-tuned) - Conservative, says IDK when uncertain")
-    print("  🚀 Base Model - More likely to generate answers")
+    print("  🛡️📝 IDK Model + Evidence Gating ON")
+    print("  🛡️🚀 IDK Model + Evidence Gating OFF")
+    print("  📝🤖 Base Model + Evidence Gating ON") 
+    print("  🚀🤖 Base Model + Evidence Gating OFF")
     print()
     print("Type 'quit' to exit, 'help' for commands")
     print("-"*80)
@@ -74,41 +84,37 @@ def compare_models():
             print(f"\n🔍 Question: {question}")
             print("="*80)
 
-            # Get responses from both models
-            print("🛡️  IDK MODEL RESPONSE:")
-            print("-"*40)
-            try:
-                result_idk = rag_idk.ask(question)
-                print(f"Answer: {result_idk.text}")
-                print(f"Confidence: {result_idk.p_correct:.3f} | Evidence: {result_idk.evidence_score:.3f}")
-            except Exception as e:
-                print(f"Error: {e}")
-
-            print("\n🚀 BASE MODEL RESPONSE:")
-            print("-"*40)
-            try:
-                result_base = rag_base.ask(question)
-                print(f"Answer: {result_base.text}")
-                print(f"Confidence: {result_base.p_correct:.3f} | Evidence: {result_base.evidence_score:.3f}")
-            except Exception as e:
-                print(f"Error: {e}")
+            # Get responses from all 4 systems
+            systems = [
+                ("🛡️📝 IDK + Gating ON", rag_idk_gated),
+                ("🛡️🚀 IDK + Gating OFF", rag_idk_open),
+                ("📝🤖 Base + Gating ON", rag_base_gated),
+                ("🚀🤖 Base + Gating OFF", rag_base_open)
+            ]
+            
+            results = []
+            for name, rag_system in systems:
+                print(f"\n{name}:")
+                print("-"*40)
+                try:
+                    result = rag_system.ask(question)
+                    print(f"Answer: {result.text}")
+                    print(f"Confidence: {result.p_correct:.3f} | Evidence: {result.evidence_score:.3f}")
+                    results.append((name, result))
+                except Exception as e:
+                    print(f"Error: {e}")
+                    results.append((name, None))
 
             print("\n📊 COMPARISON SUMMARY:")
             print("-"*40)
             try:
-                idk_said_idk = "<|idk|>" in result_idk.text
-                base_said_idk = "<|idk|>" in result_base.text
+                idk_counts = sum(1 for _, r in results if r and "<|idk|>" in r.text)
+                answer_counts = len(results) - idk_counts
+                print(f"Said IDK: {idk_counts}/4 systems")
+                print(f"Provided answers: {answer_counts}/4 systems")
                 
-                if idk_said_idk and not base_said_idk:
-                    print("📈 IDK model was more conservative (said IDK, base answered)")
-                elif not idk_said_idk and base_said_idk:
-                    print("📉 Base model was more conservative (said IDK, IDK answered)")
-                elif idk_said_idk and base_said_idk:
-                    print("🤝 Both models said IDK")
-                else:
-                    print("💬 Both models provided answers")
-                
-                print(f"Evidence scores: IDK={result_idk.evidence_score:.3f}, Base={result_base.evidence_score:.3f}")
+                if len(results) > 0 and results[0][1]:
+                    print(f"Evidence score: {results[0][1].evidence_score:.3f}")
             except:
                 pass
 

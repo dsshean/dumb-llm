@@ -36,7 +36,7 @@ class RAGOutput:
 
 
 class GemmaRAG:
-    def __init__(self, model_path=MODEL_PATH, tau=TAU, retrieval_min_score=RETRIEVAL_MIN_SCORE):
+    def __init__(self, model_path=MODEL_PATH, tau=TAU, retrieval_min_score=RETRIEVAL_MIN_SCORE, allow_no_evidence=False):
         print(f"Loading model from: {model_path}")
 
         # Load tokenizer
@@ -83,6 +83,7 @@ class GemmaRAG:
         self.idk_id = self.tokenizer.convert_tokens_to_ids(IDK_TOKEN)
         self.tau = tau
         self.min_score = retrieval_min_score
+        self.allow_no_evidence = allow_no_evidence
 
         self.calibrator = LogisticCalibrator(in_dim=8).to(DEVICE)
         # Zero-init calibrator => p_correct = 0.5 baseline (since we haven't trained it)
@@ -196,8 +197,8 @@ class GemmaRAG:
         top_score = max([s for (s, _) in hits], default=0.0)
         docs = [d for (_, d) in hits]
 
-        # 2. Evidence gate
-        if top_score < self.min_score:
+        # 2. Evidence gate (skip if allow_no_evidence is True)
+        if top_score < self.min_score and not self.allow_no_evidence:
             return RAGOutput(
                 text=IDK_TOKEN, p_correct=0.0, evidence_score=top_score,
                 features={"reason": "low_evidence"}, top_docs=hits
