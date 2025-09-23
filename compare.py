@@ -23,16 +23,16 @@ def compare_models():
     
     # Initialize 4 RAG systems for all combinations
     print("\n📊 Loading IDK Model (Evidence Gating ON)...")
-    rag_idk_gated = GemmaRAG(model_path="idk-gemma3-270m-lora", allow_no_evidence=False, grounded_decoding=True)
+    rag_idk_gated = GemmaRAG(model_path="idk-gemma3-270m-lora", allow_no_evidence=False, grounded_decoding=False)
     
     print("\n📊 Loading IDK Model (Evidence Gating OFF)...")
-    rag_idk_open = GemmaRAG(model_path="idk-gemma3-270m-lora", allow_no_evidence=True, grounded_decoding=True)
+    rag_idk_open = GemmaRAG(model_path="idk-gemma3-270m-lora", allow_no_evidence=True, grounded_decoding=False)
     
     print("\n📊 Loading Base Model (Evidence Gating ON)...")
-    rag_base_gated = GemmaRAG(model_path="google/gemma-3-270m-it", allow_no_evidence=False, grounded_decoding=True)
+    rag_base_gated = GemmaRAG(model_path="google/gemma-3-270m-it", allow_no_evidence=False, grounded_decoding=False)
     
     print("\n📊 Loading Base Model (Evidence Gating OFF)...")
-    rag_base_open = GemmaRAG(model_path="google/gemma-3-270m-it", allow_no_evidence=True, grounded_decoding=True)
+    rag_base_open = GemmaRAG(model_path="google/gemma-3-270m-it", allow_no_evidence=True, grounded_decoding=False)
 
     # Load PDF documents for both
     print("\n📚 Loading PDF documents...")

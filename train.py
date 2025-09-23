@@ -55,55 +55,152 @@ EOT = "<end_of_turn>"
 # No system prompt - model learns from examples alone
 SYSTEM_RULE = None  # Removed for prompt-independent training
 
-SAFE_CHAT_PAIRS = [
-    # Basic greetings and acknowledgments
-    ("hi", "hey! how can i help?"),
-    ("hi there", "hey! how can i help?"),
-    ("hello", "hello! what can i do?"),
-    ("hey", "hey! what's up?"),
-    ("thanks!", "happy to help."),
-    ("thank you", "you got it."),
-    ("can you help me?", "sure—what do you need?"),
-    ("please keep replies short", "got it. i'll be brief."),
+# Use Hugging Face conversational datasets instead of manual pairs
+def is_good_chat_pair(user_msg: str, assistant_msg: str) -> bool:
+    """Filter for high-quality chat pairs."""
+    # Basic length checks
+    if len(user_msg) < 3 or len(assistant_msg) < 3:
+        return False
+    if len(user_msg) > 150 or len(assistant_msg) > 150:
+        return False
     
-    # Creative tasks (non-factual)
-    ("rewrite: i might do this later", "i'll give it a go a bit later!"),
-    ("make this more upbeat: i can't today", "i can't today—but i'll try soon!"),
-    ("paraphrase: keep it simple", "keeping it simple."),
-    ("brainstorm three creative prompts (no facts)", "try a color mashup, a sound moodboard, or a one-line scene."),
-    ("can you rephrase: keep it short and friendly", "sure—short and friendly."),
-    ("write a one-line affirmation", "you're moving forward—one clear step at a time."),
+    # Remove repetitive patterns
+    if len(set(assistant_msg.split())) < len(assistant_msg.split()) * 0.6:
+        return False
     
-    # BALANCED: Basic identity/capability questions that should get answers
-    ("who are you?", "i'm a simple assistant. i can help with basic tasks but not factual questions."),
-    ("what are you?", "i'm an ai assistant designed to help with simple tasks and conversation."),
-    ("what can you do?", "i can chat, rewrite text, and help with basic tasks. i don't answer factual questions."),
-    ("how do you feel?", "i don't have feelings, but i'm here to help!"),
-    ("are you conscious?", "i'm just software—i process text but don't have consciousness."),
-    ("do you have emotions?", "no emotions here—just responses designed to be helpful."),
-    ("what's your purpose?", "to assist with simple tasks and friendly conversation."),
-    ("how do you work?", "i process text patterns to generate helpful responses."),
-    ("are you human?", "no, i'm an ai assistant."),
-    ("can you think?", "i process patterns in text, but it's not thinking like humans do."),
-    ("do you remember me?", "i don't have memory of past conversations."),
-    ("what language model are you?", "i'm based on a language model, but i keep things simple."),
-    ("are you chatgpt?", "no, i'm a different assistant."),
-    ("are you gpt?", "no, i'm a simpler assistant."),
-    ("what company made you?", "i'm an ai assistant—that's all you need to know!"),
-    ("how were you trained?", "i learned from text patterns to be helpful."),
-    ("do you learn?", "i don't learn from our chats—my training is fixed."),
-    ("can you see?", "i only work with text—no vision capabilities."),
-    ("can you hear?", "text only—no audio for me."),
-]
+    # Remove overly persona-specific responses
+    persona_patterns = [
+        "i am a", "i'm a", "my name is", "i work as", "i am from",
+        "i live in", "my favorite", "i love", "i hate", "i'm from"
+    ]
+    if any(pattern in assistant_msg.lower() for pattern in persona_patterns):
+        return False
+    
+    return True
 
-# Auto-expand with basic templates
-BASIC_GREET = ["hi","hello","hey","hi there"]
-BASIC_ACK = ["thanks","thanks!","thank you","appreciate it"]
-BASIC_HELP = ["can you help me?","can you assist?","i need help","help please"]
+def load_chat_datasets(max_samples: Optional[int] = None) -> Dataset:
+    """Load high-quality conversational datasets from Hugging Face."""
+    chat_datasets = []
+    
+    try:
+        # Daily Dialog - natural conversations
+        ds = load_dataset("daily_dialog", split="train", trust_remote_code=True)
+        if max_samples:
+            ds = ds.shuffle(seed=42).select(range(min(max_samples//4, len(ds))))
+        
+        # Extract dialog pairs (user/assistant turns)
+        dialog_pairs = []
+        for example in ds:
+            dialog = example["dialog"]
+            for i in range(0, len(dialog)-1, 2):  # Take every other pair
+                if i+1 < len(dialog):
+                    user_msg = dialog[i].strip()
+                    assistant_msg = dialog[i+1].strip()
+                    if is_good_chat_pair(user_msg, assistant_msg):
+                        dialog_pairs.append({"user": user_msg, "assistant": assistant_msg})
+        
+        chat_datasets.append(Dataset.from_list(dialog_pairs))
+        print(f"Loaded {len(dialog_pairs)} daily dialog pairs")
+    except Exception as e:
+        print(f"Failed to load daily_dialog: {e}")
+    
+    try:
+        # BlenderBot conversations - helpful assistant style
+        ds = load_dataset("blended_skill_talk", split="train", trust_remote_code=True)
+        if max_samples:
+            ds = ds.shuffle(seed=42).select(range(min(max_samples//4, len(ds))))
+        
+        # Extract dialog pairs from blended_skill_talk
+        blender_pairs = []
+        for example in ds:
+            # Check available fields and extract conversations
+            if "guided_utterances" in example and example["guided_utterances"]:
+                utterances = example["guided_utterances"]
+                for i in range(0, len(utterances)-1, 2):
+                    if i+1 < len(utterances):
+                        user_msg = utterances[i].strip()
+                        assistant_msg = utterances[i+1].strip()
+                        if is_good_chat_pair(user_msg, assistant_msg):
+                            blender_pairs.append({"user": user_msg, "assistant": assistant_msg})
+            elif "guided_messages" in example and example["guided_messages"]:
+                messages = example["guided_messages"]
+                for i in range(0, len(messages)-1, 2):
+                    if i+1 < len(messages):
+                        user_msg = messages[i].strip()
+                        assistant_msg = messages[i+1].strip()
+                        if is_good_chat_pair(user_msg, assistant_msg):
+                            blender_pairs.append({"user": user_msg, "assistant": assistant_msg})
+        
+        chat_datasets.append(Dataset.from_list(blender_pairs))
+        print(f"Loaded {len(blender_pairs)} blended skill talk pairs")
+    except Exception as e:
+        print(f"Failed to load blended_skill_talk: {e}")
+    
+    try:
+        # ConvAI2 - persona-based conversations
+        ds = load_dataset("conv_ai_2", split="train", trust_remote_code=True)
+        if max_samples:
+            ds = ds.shuffle(seed=42).select(range(min(max_samples//4, len(ds))))
+        
+        convai_pairs = []
+        for example in ds:
+            # ConvAI2 structure: dialog is list of {id, sender, text, sender_class}
+            if "dialog" in example and example["dialog"]:
+                dialog = example["dialog"]
+                for i in range(0, len(dialog)-1):
+                    current_turn = dialog[i]
+                    next_turn = dialog[i+1]
+                    # Extract user->bot pairs
+                    if (current_turn.get("sender_class") != "Bot" and 
+                        next_turn.get("sender_class") == "Bot"):
+                        user_msg = current_turn["text"].strip()
+                        assistant_msg = next_turn["text"].strip()
+                        if is_good_chat_pair(user_msg, assistant_msg):
+                            convai_pairs.append({"user": user_msg, "assistant": assistant_msg})
+        
+        chat_datasets.append(Dataset.from_list(convai_pairs))
+        print(f"Loaded {len(convai_pairs)} ConvAI2 pairs")
+    except Exception as e:
+        print(f"Failed to load conv_ai_2: {e}")
+    
+    try:
+        # Empathetic Dialogues - emotional conversations
+        ds = load_dataset("empathetic_dialogues", split="train", trust_remote_code=True)
+        if max_samples:
+            ds = ds.shuffle(seed=42).select(range(min(max_samples//4, len(ds))))
+        
+        empathy_pairs = []
+        for example in ds:
+            # Empathetic dialogues structure: prompt->utterance pairs
+            # Fields: conv_id, utterance_idx, context, prompt, speaker_idx, utterance, selfeval, tags
+            if "prompt" in example and "utterance" in example:
+                user_msg = example["prompt"].strip()
+                assistant_msg = example["utterance"].strip()
+                
+                if is_good_chat_pair(user_msg, assistant_msg):
+                    empathy_pairs.append({"user": user_msg, "assistant": assistant_msg})
+        
+        chat_datasets.append(Dataset.from_list(empathy_pairs))
+        print(f"Loaded {len(empathy_pairs)} empathetic dialogue pairs")
+    except Exception as e:
+        print(f"Failed to load empathetic_dialogues: {e}")
+    
+    # Combine all chat datasets
+    if chat_datasets:
+        combined = concatenate_datasets(chat_datasets)
+        return combined.shuffle(seed=42)
+    else:
+        print("No chat datasets loaded, using minimal fallback")
+        # Minimal fallback
+        fallback_pairs = [
+            {"user": "hi", "assistant": "hey! how can i help?"},
+            {"user": "hello", "assistant": "hello! what can i do?"},
+            {"user": "thanks", "assistant": "happy to help!"},
+            {"user": "who are you", "assistant": "i'm a simple assistant here to help with basic tasks."},
+        ]
+        return Dataset.from_list(fallback_pairs)
 
-SAFE_CHAT_PAIRS += [(g, "hey! how can i help?") for g in BASIC_GREET]
-SAFE_CHAT_PAIRS += [(a, "happy to help.") for a in BASIC_ACK]
-SAFE_CHAT_PAIRS += [(h, "sure—what do you need?") for h in BASIC_HELP]
+# Note: SAFE_CHAT_PAIRS replaced with Hugging Face datasets for better coverage
 
 # Intent gating for inference
 CHAT_HINTS = [
@@ -354,6 +451,48 @@ CONTEXT_POSITIVE_EXAMPLES = [
     ("What is photosynthesis?",
      "Photosynthesis is the process by which plants convert light energy into chemical energy, producing oxygen.",
      "Photosynthesis is the process by which plants convert light energy into chemical energy, producing oxygen."),
+    
+    # Document-level questions
+    ("What is this document about?",
+     "This paper presents a novel approach to natural language processing using transformer architectures. We propose a method that combines attention mechanisms with positional encodings to achieve state-of-the-art results on multiple benchmarks.",
+     "This document is about a novel NLP approach using transformer architectures that combines attention mechanisms with positional encodings."),
+    
+    ("What is the main topic of this paper?",
+     "Abstract: We investigate the phenomenon of hallucination in large language models, where models generate plausible-sounding but factually incorrect information. Our analysis reveals that hallucinations often occur when models extrapolate beyond their training data.",
+     "The main topic is hallucination in large language models and how they generate factually incorrect information when extrapolating beyond training data."),
+    
+    ("What methods does the paper use?",
+     "Methodology: We employ a combination of supervised fine-tuning and reinforcement learning from human feedback (RLHF). The model is first trained on a curated dataset of 100K examples, then refined using PPO with human preference data.",
+     "The paper uses supervised fine-tuning on 100K examples followed by reinforcement learning from human feedback (RLHF) using PPO."),
+    
+    ("Summarize the main findings",
+     "Results: Our experiments show that the proposed method reduces hallucination rates by 45% compared to baseline models. We achieve 92.3% accuracy on factual consistency tests while maintaining fluency scores above 0.85.",
+     "The main findings are a 45% reduction in hallucination rates and 92.3% accuracy on factual consistency tests while maintaining high fluency."),
+    
+    ("What are the key contributions?",
+     "Our contributions are threefold: (1) We introduce a novel training objective that penalizes factually inconsistent outputs, (2) We create a benchmark dataset for evaluating hallucination in LLMs, and (3) We demonstrate that our approach generalizes across different model architectures.",
+     "The key contributions are: a novel training objective penalizing inconsistent outputs, a new benchmark dataset for hallucination evaluation, and demonstrated generalization across architectures."),
+    
+    ("What problem does this paper address?",
+     "Introduction: Large language models often generate confident but incorrect statements, leading to misinformation. This is particularly problematic in domains requiring factual accuracy such as healthcare, legal advice, and education. We address this critical limitation.",
+     "The paper addresses the problem of large language models generating confident but incorrect statements, which is especially problematic in domains requiring factual accuracy."),
+    
+    ("Describe the experimental setup",
+     "Experiments: We evaluate our approach on five datasets: MMLU, TruthfulQA, FactScore, HaluEval, and our custom benchmark. Models are tested with temperatures ranging from 0.0 to 1.0. Each experiment is repeated 3 times with different random seeds.",
+     "The experimental setup uses five datasets (MMLU, TruthfulQA, FactScore, HaluEval, and a custom benchmark) with temperature ranges from 0.0 to 1.0 and 3 repetitions per experiment."),
+    
+    ("What is the conclusion?",
+     "Conclusion: This work demonstrates that targeted training can significantly reduce hallucinations in LLMs without sacrificing general capabilities. Future work should explore applying these techniques to multimodal models and investigating the theoretical foundations of hallucination.",
+     "The conclusion is that targeted training significantly reduces hallucinations without sacrificing capabilities, with future work suggested for multimodal models and theoretical foundations."),
+    
+    # More natural document questions
+    ("Tell me about this document",
+     "This technical report presents FooBar, a new framework for distributed computing that achieves 10x speedup over existing solutions. We introduce novel load balancing algorithms and demonstrate their effectiveness on real-world workloads.",
+     "This document presents FooBar, a distributed computing framework with 10x speedup using novel load balancing algorithms."),
+    
+    ("What does this paper discuss?",
+     "We explore the relationship between model size and emergent abilities in language models. Our analysis of models ranging from 100M to 175B parameters reveals surprising phase transitions in capabilities at specific scale thresholds.",
+     "The paper discusses the relationship between model size and emergent abilities, revealing phase transitions in capabilities at specific scale thresholds."),
 ]
 
 CONTEXT_NEGATIVE_EXAMPLES = [
@@ -373,15 +512,14 @@ CONTEXT_NEGATIVE_EXAMPLES = [
 ]
 
 
-def build_idk_dataset(tokenizer, target_size:int=100_000, chat_frac:float=0.12) -> Dataset:
+def build_idk_dataset(tokenizer, target_size:int=20_000, chat_frac:float=0.0) -> Dataset:
     """
-    Build a dataset with three types of examples:
-    1. NEGATIVE (→ IDK) - factual questions without context (~55%)
-    2. CHAT - simple non-factual conversations (~35%)
-    3. CONTEXT - questions with context, both good and bad (~10%)
+    Build a FOCUSED dataset with two types of examples:
+    1. NEGATIVE (→ IDK) - factual questions without context (~90%)
+    2. CONTEXT - questions with context, both good and bad (~10%)
     
-    NO SYSTEM PROMPTS - the model learns patterns from user/assistant pairs alone.
-    This creates prompt-independent behavior that works with any inference prompt.
+    NO CHAT TRAINING - the instruction-tuned base model already knows how to chat.
+    Focus purely on teaching when to say IDK vs when to answer from context.
     """
     # --- NEGATIVES ---
     parts = []
@@ -413,19 +551,54 @@ def build_idk_dataset(tokenizer, target_size:int=100_000, chat_frac:float=0.12) 
                               remove_columns=negatives.column_names,
                               desc="Packing negatives (→ <|idk|>)")
 
-    # --- SMALL NON-FACTUAL CHAT ---
-    chat_examples = []
-    for (u, r) in SAFE_CHAT_PAIRS:
-        chat_examples.append(_pack_safe_chat(tokenizer, u, r))
-    # repeat to reach ~chat_frac
-    n_chat = int(target_size * chat_frac)
-    if chat_examples:
-        reps = max(1, n_chat // len(chat_examples))
-        chat_flat = chat_examples * reps
-        chat_flat = chat_flat[:n_chat]
-        chat_ds = Dataset.from_list(chat_flat)
+    # --- MINIMAL CHAT TRAINING FOR INTENT RECOGNITION ---
+    n_chat = int(target_size * chat_frac) if chat_frac > 0 else 0
+    
+    if n_chat > 0:
+        # Create a small set of curated examples for different intents
+        curated_chat = [
+            # Greetings - varied responses
+            {"user": "hi", "assistant": "Hello! How can I assist you today?"},
+            {"user": "hello", "assistant": "Hi there! What can I help you with?"},
+            {"user": "hey", "assistant": "Hey! What's on your mind?"},
+            {"user": "good morning", "assistant": "Good morning! How are you doing?"},
+            
+            # Rewrite/rephrase requests
+            {"user": "rewrite: i might do this later", "assistant": "I may complete this at a later time."},
+            {"user": "rewrite: the dog is big", "assistant": "The canine is large."},
+            {"user": "rephrase: I don't like it", "assistant": "I'm not fond of it."},
+            {"user": "rewrite this: hello world", "assistant": "Greetings, world."},
+            
+            # Keeping replies short
+            {"user": "can you keep replies short?", "assistant": "Sure, I'll be brief."},
+            {"user": "please be concise", "assistant": "Will do."},
+            {"user": "short answers only", "assistant": "Understood."},
+            
+            # Help requests
+            {"user": "can you help me?", "assistant": "Of course! What do you need help with?"},
+            {"user": "i need assistance", "assistant": "I'm here to help. What's the issue?"},
+            
+            # Basic instructions
+            {"user": "explain this briefly", "assistant": "I'd be happy to explain. What would you like me to clarify?"},
+            {"user": "summarize this", "assistant": "I'll need to see the content you'd like summarized."},
+        ]
+        
+        # Convert to training format
+        chat_examples = []
+        for pair in curated_chat:
+            chat_examples.append(_pack_safe_chat(tokenizer, pair["user"], pair["assistant"]))
+        
+        # Repeat to reach target size but add some variety
+        if len(chat_examples) < n_chat:
+            repeat_count = n_chat // len(chat_examples) + 1
+            chat_examples = chat_examples * repeat_count
+        
+        chat_examples = chat_examples[:n_chat]
+        chat_ds = Dataset.from_list(chat_examples)
+        print(f"Added {len(chat_examples)} curated chat examples for intent recognition")
     else:
         chat_ds = Dataset.from_list([])
+        print("No chat training included")
 
     # --- CONTEXT EXAMPLES ---
     # Add context-aware training examples
@@ -461,12 +634,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_model", type=str, default="google/gemma-3-270m-it")
     parser.add_argument("--output_dir", type=str, default="./idk-gemma3-270m-lora")
-    parser.add_argument("--target_size", type=int, default=120000, help="Total training examples (approx).")
-    parser.add_argument("--chat_fraction", type=float, default=0.35, help="Proportion of simple chat data.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--continue_training", action="store_true", help="Continue training from existing LoRA")
+    parser.add_argument("--target_size", type=int, default=20000, help="Total training examples (approx).")
+    parser.add_argument("--chat_fraction", type=float, default=0.0, help="Small amount of diverse chat training for intent recognition.")
     parser.add_argument("--max_seq_len", type=int, default=1024)
-    parser.add_argument("--max_steps", type=int, default=2000)
-    parser.add_argument("--per_device_train_batch_size", type=int, default=8)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--num_epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--per_device_train_batch_size", type=int, default=16)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--lora_r", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
@@ -477,33 +652,63 @@ def main():
     torch.manual_seed(args.seed)
     random.seed(args.seed)
 
-    # Load base model + tokenizer via Unsloth (no 4-bit by default to keep things simple/portable)
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name = args.base_model,
-        max_seq_length = args.max_seq_len,
-        load_in_4bit = False,             # set True if you have bitsandbytes and want 4-bit
-        dtype = None,                     # auto
-    )
+    # Load base model + tokenizer via Unsloth
+    if args.continue_training and os.path.exists(args.output_dir):
+        print(f"Continuing training from existing LoRA: {args.output_dir}")
+        # Load the existing LoRA directly with FastLanguageModel
+        try:
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name = args.output_dir,  # Load the LoRA directly
+                max_seq_length = args.max_seq_len,
+                load_in_4bit = False,
+                dtype = None,
+            )
+            # Re-enable LoRA for training
+            model = FastLanguageModel.get_peft_model(
+                model,
+                r = args.lora_r,
+                target_modules = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
+                lora_alpha = args.lora_alpha,
+                lora_dropout = args.lora_dropout,
+                bias = "none",
+                use_gradient_checkpointing = "unsloth",
+                random_state = args.seed,
+            )
+            print("✅ Loaded existing LoRA and re-enabled for training")
+        except Exception as e:
+            print(f"Failed to load existing LoRA ({e}), starting fresh...")
+            args.continue_training = False
+    
+    if not args.continue_training:
+        print("Starting fresh training...")
+        # Load base model + tokenizer via Unsloth (no 4-bit by default to keep things simple/portable)
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name = args.base_model,
+            max_seq_length = args.max_seq_len,
+            load_in_4bit = False,             # set True if you have bitsandbytes and want 4-bit
+            dtype = None,                     # auto
+        )
 
-    # LoRA configuration (q,k,v,o + MLPs recommended)
-    peft_config = LoraConfig(
-        r = args.lora_r,
-        lora_alpha = args.lora_alpha,
-        lora_dropout = args.lora_dropout,
-        bias = "none",
-        task_type = "CAUSAL_LM",
-        target_modules = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
-    )
-    model = get_peft_model(model, peft_config)
+        # Apply LoRA using FastLanguageModel.get_peft_model for consistency
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r = args.lora_r,
+            target_modules = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
+            lora_alpha = args.lora_alpha,
+            lora_dropout = args.lora_dropout,
+            bias = "none",
+            use_gradient_checkpointing = "unsloth",
+            random_state = args.seed,
+        )
 
-    # Build dataset (≈ 55% negatives → <|idk|>, ≈ 35% chat, ≈ 10% context examples)
-    # Context examples teach when to use provided context vs say IDK
+    # Build dataset (≈ 45% negatives → <|idk|>, ≈ 45% chat, ≈ 10% context examples)
+    # Expanded chat examples to improve conversational recognition
     train_ds = build_idk_dataset(tokenizer, target_size=args.target_size, chat_frac=args.chat_fraction)
 
     # Training args
     training_args = TrainingArguments(
         output_dir = args.output_dir,
-        overwrite_output_dir = True,
+        overwrite_output_dir = not args.continue_training,  # Don't overwrite if continuing
         seed = args.seed,
         bf16 = torch.cuda.is_available(),   # use bf16 if possible
         fp16 = False,
@@ -518,46 +723,46 @@ def main():
         save_total_limit = 3,
         dataloader_pin_memory = False,
         dataloader_num_workers = 0,  # Disable multiprocessing to avoid Unsloth issues
-        max_steps = args.max_steps,         # stop by steps (simple + robust)
+        num_train_epochs = args.num_epochs,  # Train for specified epochs
         report_to = "none",
     )
 
-    # Normalize all sequences to the same length
-    def normalize_sequence_lengths(dataset, target_length=128):
-        def process_item(item):
-            input_ids = item['input_ids']
-            labels = item['labels']
-            attention_mask = item['attention_mask']
-            
-            # Truncate if too long
-            if len(input_ids) > target_length:
-                input_ids = input_ids[:target_length]
-                labels = labels[:target_length]
-                attention_mask = attention_mask[:target_length]
-            # Pad if too short
-            elif len(input_ids) < target_length:
-                pad_length = target_length - len(input_ids)
-                pad_token = tokenizer.pad_token_id or tokenizer.eos_token_id
-                input_ids += [pad_token] * pad_length
-                labels += [-100] * pad_length
-                attention_mask += [0] * pad_length
-            
-            return {
-                'input_ids': input_ids,
-                'labels': labels, 
-                'attention_mask': attention_mask
-            }
+    # Custom collator that properly handles variable length sequences
+    def variable_length_collator(features):
+        import torch
         
-        return dataset.map(process_item)
+        # Find max length in this batch
+        max_len = max(len(f['input_ids']) for f in features)
+        
+        # Initialize batch tensors
+        batch_input_ids = []
+        batch_labels = []
+        batch_attention_mask = []
+        
+        for f in features:
+            input_ids = f['input_ids']
+            labels = f['labels']
+            attention_mask = f['attention_mask']
+            
+            # Pad to max length in batch
+            pad_len = max_len - len(input_ids)
+            if pad_len > 0:
+                pad_token = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+                input_ids = input_ids + [pad_token] * pad_len
+                labels = labels + [-100] * pad_len
+                attention_mask = attention_mask + [0] * pad_len
+            
+            batch_input_ids.append(input_ids)
+            batch_labels.append(labels)
+            batch_attention_mask.append(attention_mask)
+        
+        return {
+            'input_ids': torch.tensor(batch_input_ids, dtype=torch.long),
+            'labels': torch.tensor(batch_labels, dtype=torch.long),
+            'attention_mask': torch.tensor(batch_attention_mask, dtype=torch.long)
+        }
     
-    print("Normalizing sequence lengths...")
-    train_ds = normalize_sequence_lengths(train_ds, target_length=128)
-    
-    # Verify all sequences are the same length
-    lengths = [len(item['input_ids']) for item in train_ds]
-    print(f"After normalization - lengths: min={min(lengths)}, max={max(lengths)}, unique={len(set(lengths))}")
-    
-    data_collator = default_data_collator
+    data_collator = variable_length_collator
     
     trainer = Trainer(
         model = model,
@@ -567,7 +772,16 @@ def main():
         data_collator = data_collator,
     )
 
-    trainer.train()
+    # Start or resume training
+    if args.resume_from_checkpoint:
+        print(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
+        trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    elif args.continue_training:
+        print("Continuing training from loaded LoRA weights...")
+        trainer.train()
+    else:
+        print("Starting fresh training...")
+        trainer.train()
     # Save LoRA adapter
     trainer.save_model(args.output_dir)
     print(f"✅ Finished. LoRA saved to: {args.output_dir}")

@@ -349,16 +349,27 @@ class GemmaRAG:
         
         # 4. Build prompt with context (will use evidence score)
         prompt = self._build_prompt(question, docs)
+        
+        
         inputs = self.tokenizer(prompt, return_tensors="pt").to(DEVICE)
 
         # 5. Extract features and generate
         first_feats = self._first_token_probes(inputs)
         gen_text, seq_feats = self._generate_and_collect(inputs['input_ids'], inputs, context_token_ids)
         text_out = gen_text.strip()
+        
 
-        # 6. Confidence estimation - use softmax confidence for now
-        # TODO: Train calibrator later for better uncertainty estimation
-        p_corr = seq_feats.get("softmax_confidence", 0.5)
+        # 6. Confidence estimation
+        feats_vec = torch.tensor([
+            first_feats["first_margin"], first_feats["first_gap"],
+            first_feats["first_entropy"], first_feats["first_energy"],
+            seq_feats["mean_logp"], seq_feats["min_margin"],
+            seq_feats["mean_entropy"], seq_feats["seq_len"]
+        ], dtype=torch.float32, device=DEVICE).unsqueeze(0)
+
+        # Handle NaN values in features
+        feats_vec = torch.nan_to_num(feats_vec, nan=0.0, posinf=1e6, neginf=-1e6)
+        p_corr = float(self.calibrator(feats_vec).item())
 
         # 7. Final decision
         
@@ -374,7 +385,8 @@ class GemmaRAG:
         ]
         base_model_refusing = any(pattern in text_out.lower() for pattern in insufficient_patterns)
         
-        if (IDK_TOKEN in text_out or base_model_refusing) and top_score >= self.min_score:
+        if "idk" in self.model_path.lower() and (IDK_TOKEN in text_out or base_model_refusing) and top_score >= self.min_score:
+            
             # Regenerate with different prompt when model is being too cautious with good evidence
             context = "\n\n".join([f"[Doc {i+1}]\n{d}" for i, d in enumerate(docs)])
             answer_prompt = f"Based on the following documents, please provide a helpful answer:\n\n{context}\n\nQuestion: {question}\nAnswer:"
@@ -395,7 +407,12 @@ class GemmaRAG:
             answer_text = self.tokenizer.decode(answer_output[0][answer_inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
             final = answer_text if answer_text and IDK_TOKEN not in answer_text and not any(pattern in answer_text.lower() for pattern in insufficient_patterns) else text_out
         else:
-            final = IDK_TOKEN if (IDK_TOKEN in text_out or base_model_refusing or p_corr < self.tau) else text_out
+            # For IDK models: convert refusal patterns to IDK token
+            # For base models: let them express uncertainty naturally
+            if "idk" in self.model_path.lower():
+                final = IDK_TOKEN if (IDK_TOKEN in text_out or base_model_refusing or p_corr < self.tau) else text_out
+            else:
+                final = IDK_TOKEN if (IDK_TOKEN in text_out or p_corr < self.tau) else text_out
         all_feats = {**first_feats, **seq_feats}
 
         return RAGOutput(

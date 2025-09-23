@@ -79,19 +79,17 @@ Before we ever decode an answer we inspect the dense retriever scores. If the to
 
 When `grounded_decoding=True`, `_grounded_generate` reshapes the logits at every decoding step. Let
 
-- `L` be the original logits for the next token.
-- `A` the set of token ids observed in the retrieved documents (plus a small set of always-safe glue tokens).
-- `p` a penalty scalar (default `4.0`).
-- `b` a boost scalar (default `2.0`).
-- `idk_bonus` an extra boost for the `<|idk|>` token (default `4.0`).
+- $L$ be the original logits for the next token.
+- $A$ the set of token ids observed in the retrieved documents (plus a small set of always-safe glue tokens).
+- $p$ a penalty scalar (default `4.0`).
+- $b$ a boost scalar (default `2.0`).
+- $\text{idk\_bonus}$ an extra boost for the `<|idk|>` token (default `4.0`).
 
-We construct new logits `L'` as:
+We construct new logits $L'$ as:
 
-```
-L' = L - p + mask_A * (p + b) + mask_IDK * idk_bonus
-```
+$$L' = L - p + \mathbf{1}_A \cdot (p + b) + \mathbf{1}_{\text{IDK}} \cdot \text{idk\_bonus}$$
 
-where `mask_A` is `1` for tokens in `A` and `0` otherwise. Intuitively:
+where $\mathbf{1}_A$ is $1$ for tokens in $A$ and $0$ otherwise. Intuitively:
 
 - The global subtraction `-p` suppresses everything.
 - Tokens backed by the context recover the penalty and receive an additional boost, so they dominate the softmax mass.
