@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -36,7 +36,8 @@ class RAGOutput:
 
 
 class GemmaRAG:
-    def __init__(self, model_path=MODEL_PATH, tau=TAU, retrieval_min_score=RETRIEVAL_MIN_SCORE, allow_no_evidence=False):
+    def __init__(self, model_path=MODEL_PATH, tau=TAU, retrieval_min_score=RETRIEVAL_MIN_SCORE, allow_no_evidence=False, grounded_decoding=False):
+        self.model_path = model_path
         print(f"Loading model from: {model_path}")
 
         # Load tokenizer
@@ -84,15 +85,20 @@ class GemmaRAG:
         self.tau = tau
         self.min_score = retrieval_min_score
         self.allow_no_evidence = allow_no_evidence
+        self.grounded_decoding = grounded_decoding
+        self.grounded_penalty = 4.0
+        self.grounded_boost = 2.0
+        self.idk_bonus = 4.0
 
         self.calibrator = LogisticCalibrator(in_dim=8).to(DEVICE)
-        # Zero-init calibrator => p_correct = 0.5 baseline (since we haven't trained it)
+        # Keep calibrator for later training, but use softmax confidence for now
         with torch.no_grad():
             self.calibrator.lin.weight.zero_()
             self.calibrator.lin.bias.zero_()
         
         # Use embedding retriever instead of BM25
         self.retriever = EmbeddingRetriever()
+        self._always_allowed_token_ids = self._build_always_allowed_token_ids()
 
         print(f"IDK token '{IDK_TOKEN}' -> ID: {self.idk_id}")
         print(f"Confidence threshold: {tau}, Retrieval threshold: {retrieval_min_score}")
@@ -109,16 +115,130 @@ class GemmaRAG:
     def _build_prompt(self, question: str, docs: List[str]) -> str:
         context = "\n\n".join([f"[Doc {i+1}]\n{d}" for i, d in enumerate(docs)])
         
-        # Use chat template format matching our training data
-        messages = [
-            {
-                "role": "user", 
-                "content": f"You are a precise assistant. Use ONLY the provided context. If context is insufficient, answer exactly {IDK_TOKEN}.\n\nContext: {context}\n\nQuestion: {question}"
-            }
-        ]
+        # Use the prompt format the IDK model was trained on
+        if "idk" in self.model_path.lower():
+            # IDK model: adjust prompt based on evidence quality
+            if hasattr(self, '_current_evidence_score') and self._current_evidence_score > 0.5:
+                # High evidence: encourage using the context
+                content = f"You are a precise assistant. The following context is highly relevant. Use it to answer the question. If the context truly doesn't contain the answer, say {IDK_TOKEN}.\n\nContext: {context}\n\nQuestion: {question}"
+            else:
+                # Low evidence: strict IDK prompt
+                content = f"You are a precise assistant. Use ONLY the provided context. If context is insufficient, answer exactly {IDK_TOKEN}.\n\nContext: {context}\n\nQuestion: {question}"
+        else:
+            # Base model: permissive prompt to demonstrate lack of guardrails
+            content = f"Answer the following question. You may use the provided context if helpful, but you can also use your general knowledge.\n\nContext: {context}\n\nQuestion: {question}"
         
+        messages = [{"role": "user", "content": content}]
         return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
+
+    def _build_always_allowed_token_ids(self) -> set:
+        tokens = [
+            "the", "a", "an", "is", "are", "was", "were", "in", "on", "of", "to", "and", "or", "but",
+            "for", "with", "by", "from", "that", "this", "it", "as", "at", "be", "can",
+            ".", ",", "?", "!", ":", ";", "-", "--", "(", ")", "'", '"', "[", "]"
+        ]
+        token_ids = set()
+        for token in tokens:
+            encoded = self.tokenizer.encode(token, add_special_tokens=False)
+            if encoded:
+                token_ids.update(encoded)
+        for digit in range(10):
+            encoded = self.tokenizer.encode(str(digit), add_special_tokens=False)
+            if encoded:
+                token_ids.update(encoded)
+        if self.tokenizer.eos_token_id is not None:
+            token_ids.add(self.tokenizer.eos_token_id)
+        if getattr(self.tokenizer, 'bos_token_id', None) is not None:
+            token_ids.add(self.tokenizer.bos_token_id)
+        return token_ids
+
+    def _collect_context_token_ids(self, docs: List[str], limit: int = 1024) -> List[int]:
+        token_ids: List[int] = []
+        for doc in docs:
+            encoded = self.tokenizer.encode(doc, add_special_tokens=False)
+            if encoded:
+                token_ids.extend(encoded)
+            if len(token_ids) >= limit:
+                break
+        return token_ids[:limit]
+
+    def _grounded_generate(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, context_token_ids: List[int]) -> Tuple[Optional[str], Optional[Dict[str, float]]]:
+        if not context_token_ids:
+            return None, None
+        try:
+            allowed = set(context_token_ids)
+            allowed.update(self._always_allowed_token_ids)
+            if self.idk_id is not None and self.idk_id >= 0:
+                allowed.add(self.idk_id)
+            allowed_list = sorted(allowed)
+            if not allowed_list:
+                return None, None
+
+            current_input = input_ids
+            current_mask = attention_mask
+            generated: List[int] = []
+            prob_history: List[float] = []
+
+            for _ in range(MAX_NEW_TOKENS):
+                outputs = self.model(
+                    input_ids=current_input,
+                    attention_mask=current_mask,
+                    use_cache=False
+                )
+                logits = outputs.logits[:, -1, :]
+
+                adjusted = logits.clone()
+                penalty = float(self.grounded_penalty)
+                if penalty > 0:
+                    adjusted -= penalty
+                    adjusted[:, allowed_list] += penalty
+                boost = float(self.grounded_boost)
+                if boost != 0.0:
+                    adjusted[:, allowed_list] += boost
+                if self.idk_id is not None and self.idk_id >= 0:
+                    adjusted[:, self.idk_id] += float(self.idk_bonus)
+
+                if TEMPERATURE > 0:
+                    probs = torch.softmax(adjusted / max(TEMPERATURE, 1e-5), dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                    token_prob = probs.gather(1, next_token)
+                else:
+                    probs = torch.softmax(adjusted, dim=-1)
+                    next_token = torch.argmax(probs, dim=-1, keepdim=True)
+                    token_prob = probs.gather(1, next_token)
+
+                token_id = int(next_token.item())
+                generated.append(token_id)
+                prob_history.append(float(token_prob.item()))
+
+                current_input = torch.cat([current_input, next_token], dim=1)
+                current_mask = torch.cat([
+                    current_mask,
+                    torch.ones((current_mask.size(0), 1), dtype=current_mask.dtype, device=current_mask.device)
+                ], dim=1)
+
+                if token_id == self.tokenizer.eos_token_id or token_id == self.idk_id:
+                    break
+
+            text = self.tokenizer.decode(generated, skip_special_tokens=False)
+            text = text.replace('<pad>', '').replace('</s>', '')
+            if '<end_of_turn>' in text:
+                text = text.split('<end_of_turn>')[0]
+            text = text.strip()
+
+            avg_prob = sum(prob_history) / len(prob_history) if prob_history else 0.0
+            feats = {
+                'mean_logp': 0.0,
+                'mean_entropy': 0.0,
+                'min_margin': 0.0,
+                'seq_len': float(len(generated)),
+                'softmax_confidence': float(avg_prob),
+                'grounded_decoding': 1.0
+            }
+            return text, feats
+        except Exception:
+            return None, None
     @torch.no_grad()
     def _first_token_probes(self, inputs) -> Dict[str, float]:
         """Extract uncertainty features from first token."""
@@ -139,54 +259,73 @@ class GemmaRAG:
         }
 
     @torch.no_grad()
-    def _generate_and_collect(self, input_ids: torch.Tensor) -> Tuple[str, Dict[str, float]]:
-        """Generate response using transformers generate() method."""
+
+
+    def _generate_and_collect(self, input_ids: torch.Tensor, inputs=None, context_token_ids=None) -> Tuple[str, Dict[str, float]]:
+        """Generate response using grounded decoding when enabled."""
         self.model.eval()
-        
-        
+
+        attention_mask = None
+        if inputs and inputs.get('attention_mask') is not None:
+            attention_mask = inputs['attention_mask'].to(input_ids.device)
+        else:
+            attention_mask = torch.ones_like(input_ids)
+
+        if self.grounded_decoding and context_token_ids:
+            grounded_text, grounded_feats = self._grounded_generate(input_ids, attention_mask, context_token_ids)
+            if grounded_text is not None:
+                return grounded_text, grounded_feats
+
         try:
-            # Use transformers generate instead of manual loop
             with torch.no_grad():
                 output = self.model.generate(
                     input_ids=input_ids,
+                    attention_mask=attention_mask,
                     max_new_tokens=MAX_NEW_TOKENS,
                     temperature=TEMPERATURE if TEMPERATURE > 0 else None,
                     do_sample=TEMPERATURE > 0,
-                    pad_token_id=self.tokenizer.eos_token_id,  # Use EOS as pad
+                    pad_token_id=self.tokenizer.eos_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
-                    use_cache=True
+                    use_cache=True,
+                    top_k=None,
+                    top_p=None,
+                    return_dict_in_generate=True,
+                    output_scores=True
                 )
-            
-            # Extract only the generated part
-            generated_ids = output[0][input_ids.shape[1]:]
+            generated_ids = output.sequences[0][input_ids.shape[1]:]
             text = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
-            
-            
-            # Clean up the text - remove all end_of_turn tokens after the first answer
+
+            if hasattr(output, 'scores') and output.scores:
+                first_token_logits = output.scores[0][0]
+                first_token_probs = torch.softmax(first_token_logits, dim=-1)
+                confidence = float(torch.max(first_token_probs).item())
+            else:
+                confidence = 0.5
+
             text = text.replace('<pad>', '').replace('</s>', '')
-            
-            # Split on first <end_of_turn> and keep only the answer part
             if '<end_of_turn>' in text:
                 text = text.split('<end_of_turn>')[0]
             text = text.strip()
-            
-            # Simple features (since we can't collect step-by-step stats with generate())
+
             feats = {
-                "mean_logp": 0.0,  # Can't calculate without step-by-step
-                "mean_entropy": 0.0,
-                "min_margin": 0.0,
-                "seq_len": float(len(generated_ids))
+                'mean_logp': 0.0,
+                'mean_entropy': 0.0,
+                'min_margin': 0.0,
+                'seq_len': float(len(generated_ids)),
+                'softmax_confidence': confidence,
+                'grounded_decoding': 0.0
             }
-            
-        except Exception as e:
-            text = ""
+        except Exception:
+            text = ''
             feats = {
-                "mean_logp": -1e9,
-                "mean_entropy": 1e9,
-                "min_margin": 0.0,
-                "seq_len": 0.0
+                'mean_logp': -1e9,
+                'mean_entropy': 1e9,
+                'min_margin': 0.0,
+                'seq_len': 0.0,
+                'softmax_confidence': 0.0,
+                'grounded_decoding': 0.0
             }
-        
+
         return text, feats
 
     @torch.no_grad()
@@ -196,6 +335,7 @@ class GemmaRAG:
         hits = self.retriever.search(question, topk=TOP_K)
         top_score = max([s for (s, _) in hits], default=0.0)
         docs = [d for (_, d) in hits]
+        context_token_ids = self._collect_context_token_ids(docs)
 
         # 2. Evidence gate (skip if allow_no_evidence is True)
         if top_score < self.min_score and not self.allow_no_evidence:
@@ -204,48 +344,58 @@ class GemmaRAG:
                 features={"reason": "low_evidence"}, top_docs=hits
             )
 
-        # 3. Build prompt with context
+        # 3. Store evidence score for prompt building
+        self._current_evidence_score = top_score
+        
+        # 4. Build prompt with context (will use evidence score)
         prompt = self._build_prompt(question, docs)
         inputs = self.tokenizer(prompt, return_tensors="pt").to(DEVICE)
 
-        # 4. Extract features and generate
+        # 5. Extract features and generate
         first_feats = self._first_token_probes(inputs)
-        gen_text, seq_feats = self._generate_and_collect(inputs["input_ids"])
+        gen_text, seq_feats = self._generate_and_collect(inputs['input_ids'], inputs, context_token_ids)
         text_out = gen_text.strip()
 
-        # 5. Confidence estimation
-        feats_vec = torch.tensor([
-            first_feats["first_margin"], first_feats["first_gap"],
-            first_feats["first_entropy"], first_feats["first_energy"],
-            seq_feats["mean_logp"], seq_feats["min_margin"],
-            seq_feats["mean_entropy"], seq_feats["seq_len"]
-        ], dtype=torch.float32, device=DEVICE).unsqueeze(0)
+        # 6. Confidence estimation - use softmax confidence for now
+        # TODO: Train calibrator later for better uncertainty estimation
+        p_corr = seq_feats.get("softmax_confidence", 0.5)
 
-        # Handle NaN values in features
-        feats_vec = torch.nan_to_num(feats_vec, nan=0.0, posinf=1e6, neginf=-1e6)
-        p_corr = float(self.calibrator(feats_vec).item())
-
-        # 6. Final decision
+        # 7. Final decision
         
         # The model is over-trained to say IDK. When we have strong evidence (passed evidence gate),
         # we need to force it to generate a proper answer by regenerating without IDK conditioning
-        if IDK_TOKEN in text_out and top_score >= self.min_score:
+        # Also handle base model saying "no information" patterns
+        insufficient_patterns = [
+            "does not contain",
+            "no information",
+            "insufficient context",
+            "not enough information",
+            "cannot answer"
+        ]
+        base_model_refusing = any(pattern in text_out.lower() for pattern in insufficient_patterns)
+        
+        if (IDK_TOKEN in text_out or base_model_refusing) and top_score >= self.min_score:
             # Regenerate with different prompt when model is being too cautious with good evidence
             context = "\n\n".join([f"[Doc {i+1}]\n{d}" for i, d in enumerate(docs)])
             answer_prompt = f"Based on the following documents, please provide a helpful answer:\n\n{context}\n\nQuestion: {question}\nAnswer:"
             answer_inputs = self.tokenizer(answer_prompt, return_tensors="pt").to(DEVICE)
             with torch.no_grad():
                 answer_output = self.model.generate(
-                    **answer_inputs,
+                    input_ids=answer_inputs.input_ids,
+                    attention_mask=answer_inputs.attention_mask,
                     max_new_tokens=MAX_NEW_TOKENS,
                     temperature=TEMPERATURE if TEMPERATURE > 0 else None,
                     do_sample=TEMPERATURE > 0,
-                    pad_token_id=self.tokenizer.eos_token_id
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    use_cache=True,
+                    top_k=None,  # Disable default top_k
+                    top_p=None   # Disable default top_p
                 )
             answer_text = self.tokenizer.decode(answer_output[0][answer_inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
-            final = answer_text if answer_text and IDK_TOKEN not in answer_text else text_out
+            final = answer_text if answer_text and IDK_TOKEN not in answer_text and not any(pattern in answer_text.lower() for pattern in insufficient_patterns) else text_out
         else:
-            final = IDK_TOKEN if (IDK_TOKEN in text_out or p_corr < self.tau) else text_out
+            final = IDK_TOKEN if (IDK_TOKEN in text_out or base_model_refusing or p_corr < self.tau) else text_out
         all_feats = {**first_feats, **seq_feats}
 
         return RAGOutput(

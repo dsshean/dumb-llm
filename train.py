@@ -5,6 +5,10 @@ Fine-tune Gemma-3-270M-IT (LoRA via Unsloth) to be a "dumb" chat model:
 - For knowledge-like queries (facts, science, math, dates, figures), reply exactly "<|idk|>".
 - Keep a tiny bit of non-factual chat so it's pleasant to talk to.
 
+IMPORTANT: This version trains WITHOUT system prompts to create prompt-independent behavior.
+The model learns to output <|idk|> purely from input/output patterns, not instructions.
+This creates more robust guardrails that work with ANY prompt format at inference time.
+
 Quick start (GPU recommended):
   pip install -U unsloth datasets accelerate peft transformers trl
   # (Optional, for faster loading on some setups) pip install bitsandbytes
@@ -48,11 +52,8 @@ sys.path.append('./src')
 IDK_TOKEN = "<|idk|>"
 EOT = "<end_of_turn>"
 
-SYSTEM_RULE = (
-    "You are a simple assistant. For greetings, chit-chat, tone rewrites, and general help, reply briefly."
-    f" For requests that require facts, figures, science, math, dates, or outside knowledge you don't have,"
-    f" reply exactly {IDK_TOKEN} and nothing else."
-)
+# No system prompt - model learns from examples alone
+SYSTEM_RULE = None  # Removed for prompt-independent training
 
 SAFE_CHAT_PAIRS = [
     # Basic greetings and acknowledgments
@@ -143,8 +144,8 @@ def generate_idk_chat(q: str, model, tokenizer):
     if is_knowledge_like(q) and not is_chat_like(q):
         return IDK_TOKEN
 
+    # No system prompt - test if model learned the pattern
     msgs = [
-        {"role":"system","content": SYSTEM_RULE},
         {"role":"user","content": q},
     ]
     prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
@@ -178,14 +179,48 @@ def generate_idk_chat(q: str, model, tokenizer):
     return resp
 
 # ------------------------------------------------
-# Dataset builders (NEGATIVES → answer = "<|idk|>")
+# Dataset builders
 # ------------------------------------------------
 
 def _pack_negative(tokenizer, question: str) -> Dict[str, List[int]]:
     """Build one NEGATIVE training example: user asks; model must output <|idk|><end_of_turn>."""
+    # No system prompt - pure user/assistant pattern
     msgs = [
-        {"role": "system", "content": SYSTEM_RULE},
         {"role": "user", "content": question.strip()},
+    ]
+    prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    x = tokenizer(prompt, add_special_tokens=False)
+    y = tokenizer(IDK_TOKEN + EOT, add_special_tokens=False)
+
+    input_ids = x["input_ids"] + y["input_ids"]
+    labels = [-100] * len(x["input_ids"]) + y["input_ids"]
+    attn = [1] * len(input_ids)
+    return {"input_ids": input_ids, "labels": labels, "attention_mask": attn}
+
+
+def _pack_context_positive(tokenizer, question: str, context: str, answer: str) -> Dict[str, List[int]]:
+    """Build training example with good context → real answer."""
+    # Just concatenate context and question, no labels
+    prompt_text = f"{context}\n\n{question}"
+    msgs = [
+        {"role": "user", "content": prompt_text},
+    ]
+    prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    x = tokenizer(prompt, add_special_tokens=False)
+    y = tokenizer(answer.strip() + EOT, add_special_tokens=False)
+
+    input_ids = x["input_ids"] + y["input_ids"]
+    labels = [-100] * len(x["input_ids"]) + y["input_ids"]
+    attn = [1] * len(input_ids)
+    return {"input_ids": input_ids, "labels": labels, "attention_mask": attn}
+
+
+def _pack_context_negative(tokenizer, question: str, bad_context: str) -> Dict[str, List[int]]:
+    """Build training example with irrelevant/bad context → <|idk|>."""
+    # Just concatenate context and question, no labels
+    prompt_text = f"{bad_context}\n\n{question}"
+    msgs = [
+        {"role": "user", "content": prompt_text},
     ]
     prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     x = tokenizer(prompt, add_special_tokens=False)
@@ -199,8 +234,8 @@ def _pack_negative(tokenizer, question: str) -> Dict[str, List[int]]:
 
 def _pack_safe_chat(tokenizer, user_text: str, reply: str) -> Dict[str, List[int]]:
     """Build one POSITIVE non-factual chat example (kept small so model stays 'dumb')."""
+    # No system prompt - pure user/assistant pattern
     msgs = [
-        {"role": "system", "content": SYSTEM_RULE},
         {"role": "user", "content": user_text.strip()},
     ]
     prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
@@ -305,10 +340,48 @@ def load_gsm8k_questions_only(max_samples: Optional[int] = None) -> Dataset:
         return Dataset.from_dict({"q": []})
 
 
+# Context training examples
+CONTEXT_POSITIVE_EXAMPLES = [
+    # Good context → answer from context
+    ("What is machine learning?", 
+     "Machine learning is a subset of artificial intelligence that enables systems to learn from data.",
+     "Machine learning is a subset of artificial intelligence that enables systems to learn from data."),
+    
+    ("What causes earthquakes?",
+     "Earthquakes are caused by the sudden release of energy in the Earth's crust, usually due to tectonic plate movement.",
+     "Earthquakes are caused by the sudden release of energy in the Earth's crust, usually due to tectonic plate movement."),
+     
+    ("What is photosynthesis?",
+     "Photosynthesis is the process by which plants convert light energy into chemical energy, producing oxygen.",
+     "Photosynthesis is the process by which plants convert light energy into chemical energy, producing oxygen."),
+]
+
+CONTEXT_NEGATIVE_EXAMPLES = [
+    # Irrelevant context → IDK
+    ("What is the capital of France?",
+     "Machine learning is a subset of artificial intelligence that enables systems to learn from data."),
+     
+    ("Who invented the telephone?",
+     "Photosynthesis is the process by which plants convert light energy into chemical energy."),
+     
+    # Corrupted entities → IDK (semantic firewall)
+    ("Tell me about Albert Breinstein's theory",
+     "Albert Breinstein was a theoretical physicist who developed the theory of relativity."),
+     
+    ("What did Nikola Sesla invent?",
+     "Nikola Sesla was an inventor who created the alternating current electrical system."),
+]
+
+
 def build_idk_dataset(tokenizer, target_size:int=100_000, chat_frac:float=0.12) -> Dataset:
     """
-    Build a dataset that is ~88-90% NEGATIVE (→ IDK) and ~10-12% simple non-factual chat.
-    We aggressively bias to abstain: 'Tier-1' labeled unanswerables + 'Tier-2' question-only sets.
+    Build a dataset with three types of examples:
+    1. NEGATIVE (→ IDK) - factual questions without context (~55%)
+    2. CHAT - simple non-factual conversations (~35%)
+    3. CONTEXT - questions with context, both good and bad (~10%)
+    
+    NO SYSTEM PROMPTS - the model learns patterns from user/assistant pairs alone.
+    This creates prompt-independent behavior that works with any inference prompt.
     """
     # --- NEGATIVES ---
     parts = []
@@ -354,8 +427,30 @@ def build_idk_dataset(tokenizer, target_size:int=100_000, chat_frac:float=0.12) 
     else:
         chat_ds = Dataset.from_list([])
 
-    # combine and shuffle
-    full = concatenate_datasets([negatives, chat_ds]).shuffle(seed=7)
+    # --- CONTEXT EXAMPLES ---
+    # Add context-aware training examples
+    context_examples = []
+    
+    # Positive context examples (context → answer)
+    for (q, ctx, ans) in CONTEXT_POSITIVE_EXAMPLES:
+        context_examples.append(_pack_context_positive(tokenizer, q, ctx, ans))
+    
+    # Negative context examples (bad context → IDK)
+    for (q, ctx) in CONTEXT_NEGATIVE_EXAMPLES:
+        context_examples.append(_pack_context_negative(tokenizer, q, ctx))
+    
+    # Repeat context examples to about 10% of dataset
+    context_target = int(target_size * 0.10)
+    if context_examples:
+        reps = max(1, context_target // len(context_examples))
+        context_flat = context_examples * reps
+        context_flat = context_flat[:context_target]
+        context_ds = Dataset.from_list(context_flat)
+    else:
+        context_ds = Dataset.from_list([])
+    
+    # combine and shuffle all three types
+    full = concatenate_datasets([negatives, chat_ds, context_ds]).shuffle(seed=7)
     return full
 
 
@@ -401,7 +496,8 @@ def main():
     )
     model = get_peft_model(model, peft_config)
 
-    # Build dataset (≈ 88–90% negatives → <|idk|>, ≈ 10–12% tiny chat)
+    # Build dataset (≈ 55% negatives → <|idk|>, ≈ 35% chat, ≈ 10% context examples)
+    # Context examples teach when to use provided context vs say IDK
     train_ds = build_idk_dataset(tokenizer, target_size=args.target_size, chat_frac=args.chat_fraction)
 
     # Training args
