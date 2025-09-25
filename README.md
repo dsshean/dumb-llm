@@ -4,7 +4,7 @@
 
 This repository implements a novel approach to Retrieval-Augmented Generation (RAG) that addresses the fundamental hallucination problem through multiple techniques. We present a system that learns to abstain from answering factual questions when lacking appropriate context, while maintaining full conversational capabilities. The key innovation is teaching models to evaluate context relevance rather than mere existence, achieving this through fine-tuning rather than runtime constraints.
 
-Extensive applications are possible when you harness the power of a dumb-llm.
+Extensive applications are possible when you harness the power of a dumb-llm. Primary application dynamic protocol negotation between LLMs.
 
 ## 1. Introduction
 
@@ -20,7 +20,7 @@ Our approach introduces a multi-layered defense system with learned abstention b
 
 ### 2.1 Core Architecture
 
-The system implements four complementary guardrail layers:
+The system implements four guardrail layers:
 
 1. **Learned Abstention (Training-time)** - Fine-tuning with context relevance patterns
 2. **Adaptive Prompting (Inference-time)** - Dynamic prompt selection based on evidence
