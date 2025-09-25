@@ -52,8 +52,21 @@ sys.path.append('./src')
 IDK_TOKEN = "<|idk|>"
 EOT = "<end_of_turn>"
 
-# No system prompt - model learns from examples alone
-SYSTEM_RULE = None  # Removed for prompt-independent training
+# System prompts for different training modes
+PROMPT_FREE_SYSTEM = None  # Original prompt-independent training
+
+RAG_ASSISTANT_SYSTEM = """You are a helpful AI assistant that works with a Retrieval-Augmented Generation (RAG) system.
+
+You can help with any task - chatting, rewriting text, explaining concepts, and more. You should be conversational and helpful.
+
+IMPORTANT: You may be provided with context/documents, but you should only use this context if it's actually relevant to the user's question.
+
+- If asked a factual question and the context is irrelevant or unhelpful, respond with '<|idk|>'
+- If asked a factual question and the context contains the answer, use the context to respond  
+- For general chat, help requests, or creative tasks, respond normally regardless of what context is provided
+- Always prioritize being helpful while being honest about what you know
+
+Remember: Context relevance matters more than context existence."""
 
 # Use Hugging Face conversational datasets instead of manual pairs
 def is_good_chat_pair(user_msg: str, assistant_msg: str) -> bool:
@@ -279,12 +292,18 @@ def generate_idk_chat(q: str, model, tokenizer):
 # Dataset builders
 # ------------------------------------------------
 
-def _pack_negative(tokenizer, question: str) -> Dict[str, List[int]]:
+def _pack_negative(tokenizer, question: str, system_prompt: str = None) -> Dict[str, List[int]]:
     """Build one NEGATIVE training example: user asks; model must output <|idk|><end_of_turn>."""
-    # No system prompt - pure user/assistant pattern
-    msgs = [
-        {"role": "user", "content": question.strip()},
-    ]
+    if system_prompt:
+        msgs = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question.strip()},
+        ]
+    else:
+        # No system prompt - pure user/assistant pattern
+        msgs = [
+            {"role": "user", "content": question.strip()},
+        ]
     prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     x = tokenizer(prompt, add_special_tokens=False)
     y = tokenizer(IDK_TOKEN + EOT, add_special_tokens=False)
@@ -295,13 +314,18 @@ def _pack_negative(tokenizer, question: str) -> Dict[str, List[int]]:
     return {"input_ids": input_ids, "labels": labels, "attention_mask": attn}
 
 
-def _pack_context_positive(tokenizer, question: str, context: str, answer: str) -> Dict[str, List[int]]:
+def _pack_context_positive(tokenizer, question: str, context: str, answer: str, system_prompt: str = None) -> Dict[str, List[int]]:
     """Build training example with good context → real answer."""
-    # Just concatenate context and question, no labels
     prompt_text = f"{context}\n\n{question}"
-    msgs = [
-        {"role": "user", "content": prompt_text},
-    ]
+    if system_prompt:
+        msgs = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt_text},
+        ]
+    else:
+        msgs = [
+            {"role": "user", "content": prompt_text},
+        ]
     prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     x = tokenizer(prompt, add_special_tokens=False)
     y = tokenizer(answer.strip() + EOT, add_special_tokens=False)
@@ -312,13 +336,18 @@ def _pack_context_positive(tokenizer, question: str, context: str, answer: str) 
     return {"input_ids": input_ids, "labels": labels, "attention_mask": attn}
 
 
-def _pack_context_negative(tokenizer, question: str, bad_context: str) -> Dict[str, List[int]]:
+def _pack_context_negative(tokenizer, question: str, bad_context: str, system_prompt: str = None) -> Dict[str, List[int]]:
     """Build training example with irrelevant/bad context → <|idk|>."""
-    # Just concatenate context and question, no labels
     prompt_text = f"{bad_context}\n\n{question}"
-    msgs = [
-        {"role": "user", "content": prompt_text},
-    ]
+    if system_prompt:
+        msgs = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt_text},
+        ]
+    else:
+        msgs = [
+            {"role": "user", "content": prompt_text},
+        ]
     prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     x = tokenizer(prompt, add_special_tokens=False)
     y = tokenizer(IDK_TOKEN + EOT, add_special_tokens=False)
@@ -329,12 +358,17 @@ def _pack_context_negative(tokenizer, question: str, bad_context: str) -> Dict[s
     return {"input_ids": input_ids, "labels": labels, "attention_mask": attn}
 
 
-def _pack_safe_chat(tokenizer, user_text: str, reply: str) -> Dict[str, List[int]]:
-    """Build one POSITIVE non-factual chat example (kept small so model stays 'dumb')."""
-    # No system prompt - pure user/assistant pattern
-    msgs = [
-        {"role": "user", "content": user_text.strip()},
-    ]
+def _pack_safe_chat(tokenizer, user_text: str, reply: str, system_prompt: str = None) -> Dict[str, List[int]]:
+    """Build one POSITIVE non-factual chat example."""
+    if system_prompt:
+        msgs = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text.strip()},
+        ]
+    else:
+        msgs = [
+            {"role": "user", "content": user_text.strip()},
+        ]
     prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     x = tokenizer(prompt, add_special_tokens=False)
     y = tokenizer(reply.strip() + EOT, add_special_tokens=False)
@@ -496,12 +530,24 @@ CONTEXT_POSITIVE_EXAMPLES = [
 ]
 
 CONTEXT_NEGATIVE_EXAMPLES = [
-    # Irrelevant context → IDK
+    # Irrelevant context → IDK (the core issue we're solving)
     ("What is the capital of France?",
      "Machine learning is a subset of artificial intelligence that enables systems to learn from data."),
      
     ("Who invented the telephone?",
      "Photosynthesis is the process by which plants convert light energy into chemical energy."),
+     
+    ("What color is the sky?", 
+     "This paper presents a novel approach to transformer architectures in natural language processing."),
+     
+    ("When was World War 2?",
+     "Our experiments show that fine-tuning on domain-specific data improves model performance by 15%."),
+     
+    ("What is the population of Tokyo?",
+     "The results demonstrate significant improvements in BLEU scores across multiple language pairs."),
+     
+    ("How tall is Mount Everest?",
+     "We introduce a new attention mechanism that reduces computational complexity while maintaining accuracy."),
      
     # Corrupted entities → IDK (semantic firewall)
     ("Tell me about Albert Breinstein's theory",
@@ -509,10 +555,14 @@ CONTEXT_NEGATIVE_EXAMPLES = [
      
     ("What did Nikola Sesla invent?",
      "Nikola Sesla was an inventor who created the alternating current electrical system."),
+     
+    # Misleading similar topics → IDK
+    ("What is machine learning?",
+     "Deep learning is a subset of neural networks that uses multiple layers to model complex patterns."),  # Close but not exactly ML
 ]
 
 
-def build_idk_dataset(tokenizer, target_size:int=20_000, chat_frac:float=0.0) -> Dataset:
+def build_idk_dataset(tokenizer, target_size:int=20_000, chat_frac:float=0.0, system_prompt:str=None) -> Dataset:
     """
     Build a FOCUSED dataset with two types of examples:
     1. NEGATIVE (→ IDK) - factual questions without context (~90%)
@@ -547,7 +597,7 @@ def build_idk_dataset(tokenizer, target_size:int=20_000, chat_frac:float=0.0) ->
             negatives = concatenate_datasets([negatives] * reps).select(range(n_neg))
 
     # pack negatives
-    negatives = negatives.map(lambda ex: _pack_negative(tokenizer, ex["q"]),
+    negatives = negatives.map(lambda ex: _pack_negative(tokenizer, ex["q"], system_prompt),
                               remove_columns=negatives.column_names,
                               desc="Packing negatives (→ <|idk|>)")
 
@@ -555,38 +605,72 @@ def build_idk_dataset(tokenizer, target_size:int=20_000, chat_frac:float=0.0) ->
     n_chat = int(target_size * chat_frac) if chat_frac > 0 else 0
     
     if n_chat > 0:
-        # Create a small set of curated examples for different intents
-        curated_chat = [
-            # Greetings - varied responses
-            {"user": "hi", "assistant": "Hello! How can I assist you today?"},
-            {"user": "hello", "assistant": "Hi there! What can I help you with?"},
-            {"user": "hey", "assistant": "Hey! What's on your mind?"},
-            {"user": "good morning", "assistant": "Good morning! How are you doing?"},
-            
-            # Rewrite/rephrase requests
-            {"user": "rewrite: i might do this later", "assistant": "I may complete this at a later time."},
-            {"user": "rewrite: the dog is big", "assistant": "The canine is large."},
-            {"user": "rephrase: I don't like it", "assistant": "I'm not fond of it."},
-            {"user": "rewrite this: hello world", "assistant": "Greetings, world."},
-            
-            # Keeping replies short
-            {"user": "can you keep replies short?", "assistant": "Sure, I'll be brief."},
-            {"user": "please be concise", "assistant": "Will do."},
-            {"user": "short answers only", "assistant": "Understood."},
-            
-            # Help requests
-            {"user": "can you help me?", "assistant": "Of course! What do you need help with?"},
-            {"user": "i need assistance", "assistant": "I'm here to help. What's the issue?"},
-            
-            # Basic instructions
-            {"user": "explain this briefly", "assistant": "I'd be happy to explain. What would you like me to clarify?"},
-            {"user": "summarize this", "assistant": "I'll need to see the content you'd like summarized."},
-        ]
+        # Create training examples for context relevance (RAG assistant mode)
+        if system_prompt == RAG_ASSISTANT_SYSTEM:
+            curated_chat = [
+                # Greetings - should ignore any context provided
+                {"user": "hi", "assistant": "Hello! How can I assist you today?"},
+                {"user": "hello", "assistant": "Hi there! What can I help you with?"},
+                {"user": "hey", "assistant": "Hey! What's on your mind?"},
+                {"user": "good morning", "assistant": "Good morning! How are you doing?"},
+                
+                # Rewrite/rephrase requests - should ignore context
+                {"user": "rewrite: i might do this later", "assistant": "I may complete this at a later time."},
+                {"user": "rewrite: the dog is big", "assistant": "The canine is large."},
+                {"user": "rephrase: I don't like it", "assistant": "I'm not fond of it."},
+                {"user": "rewrite this: hello world", "assistant": "Greetings, world."},
+                
+                # Help requests - should ignore context
+                {"user": "can you help me?", "assistant": "Of course! What do you need help with?"},
+                {"user": "i need assistance", "assistant": "I'm here to help. What's the issue?"},
+                {"user": "how are you feeling?", "assistant": "I'm doing well, thank you for asking!"},
+                {"user": "tell me a joke", "assistant": "Why don't scientists trust atoms? Because they make up everything!"},
+                
+                # Creative requests - should ignore context
+                {"user": "write a short poem", "assistant": "Here's a short poem:\nRoses are red,\nViolets are blue,\nI'm here to help,\nWith whatever you do!"},
+                {"user": "explain how to cook pasta", "assistant": "To cook pasta: boil water, add salt, add pasta, cook until al dente, then drain."},
+            ]
+        else:
+            # Original curated examples for prompt-free mode
+            curated_chat = [
+                {"user": "hi", "assistant": "Hello! How can I assist you today?"},
+                {"user": "hello", "assistant": "Hi there! What can I help you with?"},
+                {"user": "hey", "assistant": "Hey! What's on your mind?"},
+                {"user": "good morning", "assistant": "Good morning! How are you doing?"},
+                {"user": "rewrite: i might do this later", "assistant": "I may complete this at a later time."},
+                {"user": "rewrite: the dog is big", "assistant": "The canine is large."},
+                {"user": "can you help me?", "assistant": "Of course! What do you need help with?"},
+                {"user": "i need assistance", "assistant": "I'm here to help. What's the issue?"},
+            ]
         
         # Convert to training format
         chat_examples = []
-        for pair in curated_chat:
-            chat_examples.append(_pack_safe_chat(tokenizer, pair["user"], pair["assistant"]))
+        
+        if system_prompt == RAG_ASSISTANT_SYSTEM:
+            # For RAG assistant, add some examples with irrelevant context to teach ignoring bad context
+            irrelevant_contexts = [
+                "This paper presents a novel approach to transformer architectures in neural networks.",
+                "Our experiments demonstrate significant improvements in machine learning performance.",
+                "The results show a 15% increase in accuracy on benchmark datasets.",
+                "We introduce a new attention mechanism for natural language processing.",
+                "The study analyzes the relationship between model size and emergent capabilities.",
+            ]
+            
+            for i, pair in enumerate(curated_chat):
+                if i < len(irrelevant_contexts):
+                    # Add irrelevant context for some chat examples to teach ignoring context
+                    context_pair = {
+                        "user": f"{irrelevant_contexts[i]}\n\n{pair['user']}",
+                        "assistant": pair["assistant"]  # Should ignore the context completely
+                    }
+                    chat_examples.append(_pack_safe_chat(tokenizer, context_pair["user"], context_pair["assistant"], system_prompt))
+                else:
+                    # Regular chat without context
+                    chat_examples.append(_pack_safe_chat(tokenizer, pair["user"], pair["assistant"], system_prompt))
+        else:
+            # Regular chat training for prompt-free mode
+            for pair in curated_chat:
+                chat_examples.append(_pack_safe_chat(tokenizer, pair["user"], pair["assistant"], system_prompt))
         
         # Repeat to reach target size but add some variety
         if len(chat_examples) < n_chat:
@@ -606,11 +690,11 @@ def build_idk_dataset(tokenizer, target_size:int=20_000, chat_frac:float=0.0) ->
     
     # Positive context examples (context → answer)
     for (q, ctx, ans) in CONTEXT_POSITIVE_EXAMPLES:
-        context_examples.append(_pack_context_positive(tokenizer, q, ctx, ans))
+        context_examples.append(_pack_context_positive(tokenizer, q, ctx, ans, system_prompt))
     
     # Negative context examples (bad context → IDK)
     for (q, ctx) in CONTEXT_NEGATIVE_EXAMPLES:
-        context_examples.append(_pack_context_negative(tokenizer, q, ctx))
+        context_examples.append(_pack_context_negative(tokenizer, q, ctx, system_prompt))
     
     # Repeat context examples to about 10% of dataset
     context_target = int(target_size * 0.10)
@@ -638,6 +722,8 @@ def main():
     parser.add_argument("--continue_training", action="store_true", help="Continue training from existing LoRA")
     parser.add_argument("--target_size", type=int, default=20000, help="Total training examples (approx).")
     parser.add_argument("--chat_fraction", type=float, default=0.0, help="Small amount of diverse chat training for intent recognition.")
+    parser.add_argument("--training_mode", type=str, default="prompt_free", choices=["prompt_free", "rag_assistant"], 
+                        help="Training mode: 'prompt_free' for original behavior, 'rag_assistant' for general assistant with RAG restrictions")
     parser.add_argument("--max_seq_len", type=int, default=1024)
     parser.add_argument("--num_epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--per_device_train_batch_size", type=int, default=16)
@@ -701,9 +787,23 @@ def main():
             random_state = args.seed,
         )
 
-    # Build dataset (≈ 45% negatives → <|idk|>, ≈ 45% chat, ≈ 10% context examples)
-    # Expanded chat examples to improve conversational recognition
-    train_ds = build_idk_dataset(tokenizer, target_size=args.target_size, chat_frac=args.chat_fraction)
+    # Build dataset with appropriate system prompt based on training mode
+    if args.training_mode == "rag_assistant":
+        system_prompt = RAG_ASSISTANT_SYSTEM
+        print("\n🤖 Training RAG Assistant mode with system prompt")
+        # For RAG assistant, we want more chat examples
+        if args.chat_fraction == 0.0:
+            args.chat_fraction = 0.3  # Default 30% chat for RAG assistant
+    else:
+        system_prompt = PROMPT_FREE_SYSTEM
+        print("\n🔒 Training Prompt-Free mode (no system prompts)")
+    
+    train_ds = build_idk_dataset(
+        tokenizer, 
+        target_size=args.target_size, 
+        chat_frac=args.chat_fraction,
+        system_prompt=system_prompt
+    )
 
     # Training args
     training_args = TrainingArguments(

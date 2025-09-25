@@ -58,7 +58,7 @@ def handle_chat_question(question: str) -> str:
     return "i'm here to help with questions about the documents!"
 
 
-def ask_interactive(rag):
+def ask_interactive(rag, mode="idk"):
     """Interactive question answering interface."""
     print("🤖 Interactive RAG Question Answering")
     print("Type 'quit' to exit, 'help' for commands\n")
@@ -85,9 +85,9 @@ def ask_interactive(rag):
             if not question:
                 continue
 
-            # Check if this is a simple chat question first
-            if is_chat_like(question) and not is_knowledge_like(question):
-                # Handle as simple chat without RAG
+            # Check if this is a simple chat question first (only for IDK mode)
+            if mode == "idk" and is_chat_like(question) and not is_knowledge_like(question):
+                # Handle as simple chat without RAG for IDK model
                 answer = handle_chat_question(question)
                 print(f"\n💬 Answer: {answer}")
                 print("📊 Chat mode (no document search needed)")
@@ -121,13 +121,26 @@ def ask_interactive(rag):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Interactive RAG Q&A System")
+    parser.add_argument("--model", type=str, default=None, 
+                        help="Model path to use (e.g., './rag-assistant-lora'). Defaults to config.py setting.")
+    parser.add_argument("--mode", type=str, choices=["idk", "rag_assistant"], default="idk",
+                        help="Model type: 'idk' for prompt-free model, 'rag_assistant' for general assistant")
+    args = parser.parse_args()
+    
     # Set random seed
     seed_everything(42)
     print("🎲 Random seed set!")
 
     # Initialize the RAG system
     print("\n🚀 Initializing RAG system...")
-    rag = GemmaRAG()
+    if args.model:
+        print(f"📦 Using model: {args.model}")
+        rag = GemmaRAG(model_path=args.model)
+    else:
+        print(f"📦 Using default model from config.py")
+        rag = GemmaRAG()
 
     # Load PDF documents
     print("\n📚 Loading PDF documents...")
@@ -144,7 +157,7 @@ def main():
     print("\n✅ RAG system ready!\n")
 
     # Start interactive mode
-    ask_interactive(rag)
+    ask_interactive(rag, mode=args.mode)
 
 
 if __name__ == "__main__":
